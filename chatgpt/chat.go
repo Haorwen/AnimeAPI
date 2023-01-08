@@ -8,178 +8,84 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/FloatTech/floatbox/binary"
 	"github.com/google/uuid"
 )
 
-const (
-	SESSION_TOKEN = "__Secure-next-auth.session-token"
-	CF_CLEARANCE  = "cf_clearance"
-)
-
-var (
-	ErrRequestTooFast  = errors.New("request too fast")
-	ErrEmptyResponse   = errors.New("empty response")
-	ErrNilSessionToken = errors.New("refresh session failed: nil token")
-	ErrNilAuth         = errors.New("refresh session failed: nil auth")
-)
-
 type ChatGPT struct {
-	config *Config
-	Auth   string
-	ConvID string
-	ParnID string
+	Auth string
 }
 
-func NewChatGPT(config *Config) *ChatGPT {
-	return &ChatGPT{config: config}
-}
-
-func (c *ChatGPT) id() string {
-	return uuid.Must(uuid.NewRandom()).String()
-}
-
-func (c *ChatGPT) setchatheaders(req *http.Request) {
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+c.Auth)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", API[:len(API)-1])
-	req.Header.Set("Referer", API+"chat")
-}
-
-func (c *ChatGPT) getbody(prompts ...string) *bytes.Buffer {
-	body := bytes.NewBuffer(make([]byte, 0, 4096))
-	body.WriteString(`{"action":"next","messages":[{"id":"`)
-	body.WriteString(c.id())
-	body.WriteString(`","role":"user","content":{"content_type":"text","parts":`)
-	_ = json.NewEncoder(body).Encode(&prompts)
-	body.Truncate(body.Len() - 1)
-	switch {
-	case c.ConvID != "":
-		body.WriteString(`}}],"conversation_id":"`)
-		body.WriteString(c.ConvID)
-		body.WriteString(`","parent_message_id":"`)
-		body.WriteString(c.ParnID)
-		body.WriteByte('"')
-	case c.ParnID != "":
-		body.WriteString(`}}],"parent_message_id":"`)
-		body.WriteString(c.ParnID)
-		body.WriteByte('"')
-	default:
-		body.WriteString(`}}]`)
-	}
-	body.WriteString(`,"model":"text-davinci-002-render"}`)
-	return body
-}
-
-type chatresponse struct {
-	Message struct {
-		ID      string `json:"id"`
-		Content struct {
-			ContentType string   `json:"content_type"`
-			Parts       []string `json:"parts"`
-		} `json:"content"`
-		Weight float64 `json:"weight"`
-	} `json:"message"`
-	ConversationID string `json:"conversation_id"`
-	Error          any    `json:"error"`
+func NewChatGPT(auth string) *ChatGPT {
+	return &ChatGPT{Auth: auth}
 }
 
 func (c *ChatGPT) GetChatResponse(prompt string) (string, error) {
-	if c.Auth == "" {
-		err := c.RefreshSession()
-		if err != nil {
-			return "", err
-		}
+	type requestBody struct {
+		Prompt  string   `json:"prompt"`
+		MaxToke int      `json:"max_tokens"`
+		Model   string   `json:"model"`
+		Tokens  []string `json:"tokens"`
 	}
-	if c.ParnID == "" {
-		c.ParnID = uuid.Must(uuid.NewRandom()).String()
+
+	url := "https://api.openai.com/v1/completions"
+	requestBody := requestBody{
+		Prompt:  prompt,
+		MaxToke: 2048,
+		Model:   "text-davinci-002",
+		Tokens:  []string{"|"},
 	}
-	body := c.getbody(prompt)
-	req, err := http.NewRequest("POST", API+"backend-api/conversation", body)
+	requestBodyBytes, err := json.Marshal(requestBody)
 	if err != nil {
 		return "", err
 	}
-	c.setchatheaders(req)
-	req.Header.Set("Content-Length", strconv.Itoa(body.Len()))
-	req.Header.Set("User-Agent", c.config.UA)
-	req.AddCookie(&http.Cookie{Name: CF_CLEARANCE, Value: c.config.CFClearance})
-	cli := &http.Client{
-		Timeout: c.config.Timeout,
-	}
-	resp, err := cli.Do(req)
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(requestBodyBytes))
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 429 {
-		return "", ErrRequestTooFast
-	}
-	s := bufio.NewScanner(resp.Body)
-	lastline := ""
-	line := ""
-	for s.Scan() {
-		l := s.Text()
-		if l == "" {
-			continue
-		}
-		lastline = line
-		line = l
-	}
-	if len(lastline) <= 6 {
-		return "", ErrEmptyResponse
-	}
-	var rsp chatresponse
-	err = json.Unmarshal(binary.StringToBytes(lastline[6:]), &rsp)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.Auth)
+
+	client := &http.Client{Timeout: time.Second * 10}
+	res, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
-	if rsp.Error != nil {
-		return "", errors.New(fmt.Sprint(rsp.Error))
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("invalid status code: %d", res.StatusCode)
 	}
-	if len(rsp.Message.Content.Parts) == 0 || rsp.ConversationID == "" || rsp.Message.ID == "" {
-		return "", ErrEmptyResponse
+
+	type responseBody struct {
+		Choices []struct {
+			Text string `json:"text"`
+		} `json:"choices"`
 	}
-	c.ConvID = rsp.ConversationID
-	c.ParnID = rsp.Message.ID
-	return rsp.Message.Content.Parts[0], nil
+
+	var response responseBody
+	err = json.NewDecoder(res.Body).Decode(&response)
+	if err != nil {
+		return "", err
+	}
+
+	if len(response.Choices) == 0 {
+		return "", fmt.Errorf("empty response")
+	}
+
+	return response.Choices[0].Text, nil
 }
 
-func (c *ChatGPT) RefreshSession() error {
-	req, err := http.NewRequest("GET", API+"api/auth/session", nil)
+func main() {
+	chatGPT := NewChatGPT("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")
+
+	response, err := chatGPT.GetChatResponse("What is the capital of France?")
 	if err != nil {
-		return err
+		fmt.Println(err)
+		return
 	}
-	req.AddCookie(&http.Cookie{Name: SESSION_TOKEN, Value: c.config.SessionToken})
-	req.AddCookie(&http.Cookie{Name: CF_CLEARANCE, Value: c.config.CFClearance})
-	req.Header.Set("User-Agent", c.config.UA)
-	cli := &http.Client{
-		Timeout: c.config.Timeout,
-	}
-	resp, err := cli.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	var rsp struct {
-		Token string `json:"accessToken"`
-	}
-	for _, cookie := range resp.Cookies() {
-		if cookie.Name == SESSION_TOKEN {
-			if cookie.Value == "" {
-				return ErrNilSessionToken
-			}
-			c.config.SessionToken = cookie.Value
-		}
-	}
-	err = json.NewDecoder(resp.Body).Decode(&rsp)
-	if err != nil {
-		return err
-	}
-	if rsp.Token == "" {
-		return ErrNilAuth
-	}
-	c.Auth = rsp.Token
-	return nil
+	fmt.Println(response)
 }
